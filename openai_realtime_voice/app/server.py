@@ -15,7 +15,10 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+try:
+    from mcp.client.streamable_http import streamable_http_client as streamablehttp_client
+except ImportError:
+    from mcp.client.streamable_http import streamablehttp_client
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("realtime-voice")
