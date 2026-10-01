@@ -29,8 +29,9 @@
 <body>
 <header>
   <button id="toggle">Start</button>
-  <span id="status">Idle</span> <button id="audio-fix" style="display:none;margin-left:10px">Tap to enable sound</button> <a href="" target="_blank" id="full" style="margin-left:12px;color:#8ab4f8">Open full page</a>
+  <span id="status">Idle</span> <span id="meter" style="margin-left:10px;font-variant-numeric:tabular-nums"></span> <button id="audio-fix" style="display:none;margin-left:10px">Tap to enable sound</button> <a href="" target="_blank" id="full" style="margin-left:12px;color:#8ab4f8">Open full page</a>
 </header>
+<details id="hist" style="padding:4px 12px;font-size:12px"><summary>Previous sessions (cost)</summary><pre id="histlist" style="margin:4px 0"></pre> <a href="" id="slog" target="_blank" style="color:#8ab4f8">Open server log</a></details>
 <div id="log"></div>
 <div id="dbgbar"><button id="beep" class="ghost">Test speaker</button> <button id="copy" class="ghost">Copy logs</button> <button id="clr" class="ghost">Clear</button> <span id="live"></span></div>
 <pre id="dbg"></pre>
@@ -47,22 +48,21 @@ let pc = null, dc = null, stream = null, audioEl = null, running = false;
 const handled = new Set();
 
 function say(text, cls) {
+  if (cls === 'user' || cls === 'assistant') sendlog('transcript ' + cls + ': ' + text);
   const d = document.createElement('div');
   d.className = 'msg ' + cls;
   d.textContent = text;
   $('log').appendChild(d);
   $('log').scrollTop = $('log').scrollHeight;
 }
-document.addEventListener('DOMContentLoaded',()=>{const f=document.getElementById('full'); if(f) f.href=location.href;});
+document.addEventListener('DOMContentLoaded',()=>{ const sl=document.getElementById('slog'); if(sl) sl.href=new URL('./logs', location.href).href; loadHistory();const f=document.getElementById('full'); if(f) f.href=location.href;});
 
 const T0 = Date.now(); let dbgLines = [];
 function dbg(msg) {
   const t = ((Date.now() - T0) / 1000).toFixed(2).padStart(7);
   const line = t + 's ' + msg; dbgLines.push(line); if (dbgLines.length > 800) dbgLines.shift();
   const el = $('dbg'); el.textContent += line + '\n'; el.scrollTop = el.scrollHeight;
-  if (/^(evt (error|response\.(created|done))|first audio|WARNING|OpenAI|tool |audio\.play|ontrack|ice |pc |getUserMedia)/.test(msg)) {
-    try { fetch('./clientlog', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ msg }) }); } catch {}
-  }
+  if (!/^STATS/.test(msg)) sendlog(msg);
 }
 window.addEventListener('error', (e) => dbg('JS ERROR: ' + e.message));
 window.addEventListener('unhandledrejection', (e) => dbg('PROMISE REJECTED: ' + (e.reason && e.reason.message || e.reason)));
@@ -90,6 +90,58 @@ async function pollStats() {
     $('live').textContent = line; if (pollStats.last !== line) { dbg('STATS ' + line); pollStats.last = line; }
   } catch (e) { dbg('stats error ' + e.message); }
 }
+
+function sendlog(msg) { try { fetch('./clientlog', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ msg }) }); } catch {} }
+let cfg = { idle: 0, prices: {}, model: '' }, lastAct = Date.now(), meterTimer = null, agentTimer = null, announced = null, agentBusy = false, toolsBusy = 0;
+let sess = null;
+function newSess() { return { t0: Date.now(), cost: 0, responses: 0, tok: { audio_in: 0, audio_out: 0, text_in: 0, text_out: 0, cached: 0 } }; }
+function touch() { lastAct = Date.now(); }
+function addUsage(u) {
+  if (!u || !sess) return;
+  const d = u.input_token_details || {}, o = u.output_token_details || {}, cd = d.cached_tokens_details || {};
+  const ain = d.audio_tokens || 0, tin = d.text_tokens || 0, cA = cd.audio_tokens || 0, cT = cd.text_tokens || 0;
+  const aout = o.audio_tokens || 0, tout = o.text_tokens || 0, p = cfg.prices || {};
+  const c = ((ain - cA) * (p.audio_in || 0) + cA * (p.audio_cached || 0) + (tin - cT) * (p.text_in || 0) + cT * (p.text_cached || 0) + aout * (p.audio_out || 0) + tout * (p.text_out || 0)) / 1e6;
+  sess.cost += c; sess.responses++;
+  sess.tok.audio_in += ain; sess.tok.audio_out += aout; sess.tok.text_in += tin; sess.tok.text_out += tout; sess.tok.cached += (d.cached_tokens || 0);
+  dbg('usage +$' + c.toFixed(4) + ' (audio in/out ' + ain + '/' + aout + ', text in/out ' + tin + '/' + tout + ') session total $' + sess.cost.toFixed(4));
+}
+function fmtDur(ms) { const s = Math.floor(ms / 1000); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); }
+function meterTick() {
+  if (!running || !sess) return;
+  $('meter').textContent = '$' + sess.cost.toFixed(4) + ' · ' + fmtDur(Date.now() - sess.t0);
+  if (cfg.idle > 0) {
+    const busy = agentBusy || toolsBusy > 0 || (tm.created && !tm.done);
+    if (busy) touch();
+    const idle = (Date.now() - lastAct) / 1000;
+    if (idle >= cfg.idle) { dbg('auto-stop: idle ' + Math.round(idle) + 's'); say('Stopped after ' + Math.round(idle) + 's of inactivity to save cost.', 'tool'); stop('idle'); return; }
+    if (idle >= cfg.idle - 15) setStatus('Auto-stop in ' + Math.max(0, Math.ceil(cfg.idle - idle)) + 's (speak to keep it open)');
+    else if ($('status').textContent.startsWith('Auto-stop')) setStatus('Connected');
+  }
+}
+async function pollAgent() {
+  try {
+    const r = await fetch('./agent/jobs'); if (!r.ok) return; const jobs = (await r.json()).jobs || [];
+    agentBusy = jobs.some((j) => j.status === 'running');
+    if (announced === null) { announced = new Set(jobs.filter((j) => j.status !== 'running').map((j) => j.id)); return; }
+    for (const j of jobs) {
+      if (j.status === 'running' || announced.has(j.id)) continue;
+      announced.add(j.id); touch();
+      dbg('agent job ' + j.id + ' ' + j.status + ' (' + j.seconds + 's' + (j.cost_usd ? ', $' + j.cost_usd.toFixed(3) : '') + ')');
+      say('agent ' + j.id + ' ' + j.status + ': ' + (j.summary || '').slice(0, 400), 'tool');
+      if (dc && dc.readyState === 'open') {
+        dc.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Background agent ' + j.id + ' finished with status ' + j.status + '. Result: ' + (j.summary || 'none').slice(0, 1500) + ' Tell me the outcome briefly.]' }] } }));
+        dc.send(JSON.stringify({ type: 'response.create' }));
+      }
+    }
+  } catch (e) { dbg('agent poll error ' + e.message); }
+}
+async function loadHistory() {
+  try {
+    const r = await fetch('./sessions'); if (!r.ok) return; const l = (await r.json()).sessions || [];
+    $('histlist').textContent = l.length ? l.map((x) => x.t.replace('T', ' ').replace('Z', ' UTC') + '  ' + fmtDur((x.seconds || 0) * 1000) + '  $' + Number(x.cost_usd || 0).toFixed(4) + '  ' + (x.reason || '')).join('\n') : '(none yet)';
+  } catch {}
+}
 function setStatus(s) { $('status').textContent = s; }
 
 function askConfirm(summary) {
@@ -105,7 +157,7 @@ function askConfirm(summary) {
 async function runTool(item) {
   if (handled.has(item.call_id)) return;
   handled.add(item.call_id);
-  say('tool: ' + item.name, 'tool'); const tt = Date.now(); dbg('tool start ' + item.name + ' ' + String(item.arguments).slice(0, 200));
+  say('tool: ' + item.name, 'tool'); const tt = Date.now(); toolsBusy++; touch(); dbg('tool start ' + item.name + ' ' + String(item.arguments).slice(0, 200));
   let out;
   try {
     let r = await fetch('./tool', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -122,6 +174,7 @@ async function runTool(item) {
       }
     } else { out = j.output ?? JSON.stringify(j); }
   } catch (e) { out = JSON.stringify({ error: String(e) }); }
+  toolsBusy = Math.max(0, toolsBusy - 1); touch();
   dbg('tool done ' + item.name + ' in ' + (Date.now() - tt) + 'ms, output ' + String(out).length + ' chars');
   dc.send(JSON.stringify({ type: 'conversation.item.create',
     item: { type: 'function_call_output', call_id: item.call_id, output: out } }));
@@ -130,6 +183,9 @@ async function runTool(item) {
 
 function onEvent(ev) {
   const ty = ev.type;
+  if (/^(input_audio_buffer\.speech|response\.(created|done)|response\.output_audio\.delta)/.test(ty)) touch();
+  if (ty === 'response.created') tm.done = false;
+  if (ty === 'response.done') { tm.done = true; addUsage(ev.response && ev.response.usage); }
   if (ty === 'response.output_audio.delta') { nAudioDelta++; if (nAudioDelta === 1) tm.firstAudio = Date.now(); if (nAudioDelta === 1) dbg('first audio chunk (+' + (Date.now() - (tm.created || Date.now())) + 'ms after response.created)'); }
   else if (ty === 'response.output_audio_transcript.delta' || ty === 'response.output_text.delta') { nTextDelta++; }
   else if (ty === 'rate_limits.updated') { }
@@ -176,7 +232,8 @@ async function start() {
   const sj = await s.json();
   if (!s.ok) { setStatus('Idle'); say(sj.error || 'Failed to start', 'tool'); return; }
 
-  dbg('session ok: model=' + sj.model + ' tools=' + sj.tool_count);
+  dbg('session ok: model=' + sj.model + ' tools=' + sj.tool_count + ' auto_stop=' + (sj.auto_stop ? sj.idle_timeout_s + 's' : 'off'));
+  cfg = { idle: sj.auto_stop ? sj.idle_timeout_s : 0, prices: sj.prices || {}, model: sj.model }; sess = newSess(); tm = {}; announced = null; agentBusy = false; toolsBusy = 0; touch();
   pc = new RTCPeerConnection();
   pc.oniceconnectionstatechange = () => dbg('ice ' + pc.iceConnectionState);
   pc.onconnectionstatechange = () => dbg('pc ' + pc.connectionState);
@@ -208,12 +265,19 @@ async function start() {
   if (!r.ok) { const tx = await r.text(); dbg('OpenAI /calls failed ' + r.status + ' ' + tx.slice(0, 300)); say('OpenAI connect failed: ' + r.status, 'tool'); stop(); return; }
   dbg('OpenAI /calls -> ' + r.status + ' in ' + (Date.now() - tc) + 'ms');
   await pc.setRemoteDescription({ type: 'answer', sdp: await r.text() });
-  running = true; dbg('webrtc connected'); statTimer = setInterval(pollStats, 2000);
+  running = true; dbg('webrtc connected'); statTimer = setInterval(pollStats, 2000); meterTimer = setInterval(meterTick, 1000); agentTimer = setInterval(pollAgent, 3000); pollAgent();
   $('toggle').textContent = 'Stop'; $('toggle').classList.add('stop');
   setStatus('Connected (' + sj.tool_count + ' tools)');
 }
 
-function stop() {
+function stop(reason) {
+  if (sess && running) {
+    const sec = Math.round((Date.now() - sess.t0) / 1000);
+    dbg('session summary: ' + fmtDur(sec * 1000) + ', ' + sess.responses + ' responses, est. cost $' + sess.cost.toFixed(4) + ' (' + JSON.stringify(sess.tok) + ')');
+    say('Session: ' + fmtDur(sec * 1000) + ' · est. $' + sess.cost.toFixed(4), 'tool');
+    try { fetch('./session_end', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seconds: sec, cost_usd: +sess.cost.toFixed(5), tokens: sess.tok, model: cfg.model, reason: typeof reason === 'string' ? reason : 'user', responses: sess.responses }) }).then(loadHistory); } catch {}
+  }
+  clearInterval(meterTimer); clearInterval(agentTimer); $('meter').textContent = '';
   dbg('stop'); clearInterval(statTimer);
   try { dc && dc.close(); } catch {}
   try { pc && pc.close(); } catch {}
