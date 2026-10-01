@@ -88,6 +88,8 @@ STATIC = Path(__file__).parent / "static"
 LOGFILE = Path("/data/voice-log.jsonl")
 JOBS: dict[str, dict] = {}
 TOOL_NAMES: list[str] = []
+TOOL_META: list[dict] = []
+TOOL_STATS: dict[str, dict] = {}
 
 LOCAL_TOOLS = [
     {
@@ -147,6 +149,18 @@ async def list_tools(raw: bool = False) -> list[dict]:
             result = await session.list_tools()
     all_names = [t.name for t in result.tools]
     TOOL_NAMES[:] = all_names
+    TOOL_META[:] = []
+    for t in result.tools:
+        sc = getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {}
+        props = sc.get("properties", {}) or {}
+        TOOL_META.append({
+            "name": t.name, "description": (t.description or "").strip(),
+            "params": [{"name": k, "type": (v.get("type") if isinstance(v, dict) else None),
+                        "required": k in (sc.get("required") or []),
+                        "description": ((v.get("description") or "")[:160] if isinstance(v, dict) else "")}
+                       for k, v in props.items()],
+            "schema_bytes": len(json.dumps(sc)),
+        })
     tools = []
     for t in result.tools:
         if ALLOW and t.name not in ALLOW:
@@ -302,6 +316,44 @@ async def logs(n: int = 400):
     return PlainTextResponse("\n".join(lines))
 
 
+@app.get("/tools")
+async def tools_view():
+    if not TOOL_META and MCP_URL:
+        with contextlib.suppress(Exception):
+            await list_tools()
+    out = []
+    for m in TOOL_META:
+        st = TOOL_STATS.get(m["name"], {})
+        out.append({**m, "exposed": (not ALLOW) or m["name"] in ALLOW,
+                    "writes": m["name"].startswith(WRITE_PREFIXES),
+                    "confirm": is_destructive(m["name"], {}),
+                    "calls": st.get("calls", 0), "errors": st.get("errors", 0),
+                    "avg_ms": int(st["total_ms"] / st["calls"]) if st.get("calls") else None,
+                    "last_ms": st.get("last_ms"), "last": st.get("last")})
+    for lt in LOCAL_TOOLS:
+        st = TOOL_STATS.get(lt["name"], {})
+        props = lt["parameters"].get("properties", {})
+        out.append({"name": lt["name"], "description": lt["description"], "local": True, "exposed": True,
+                    "writes": lt["name"] == "delegate_to_claude_agent", "confirm": lt["name"] == "delegate_to_claude_agent" and CONFIRM_AGENT,
+                    "params": [{"name": k, "type": v.get("type"), "required": k in lt["parameters"].get("required", []),
+                                "description": v.get("description", "")} for k, v in props.items()],
+                    "schema_bytes": len(json.dumps(lt["parameters"])), "calls": st.get("calls", 0), "errors": st.get("errors", 0),
+                    "avg_ms": int(st["total_ms"] / st["calls"]) if st.get("calls") else None,
+                    "last_ms": st.get("last_ms"), "last": st.get("last")})
+    return {"tools": out, "total": len(TOOL_META), "exposed": sum(1 for t in out if t["exposed"]),
+            "allowlist": sorted(ALLOW)}
+
+
+@app.get("/logs.json")
+async def logs_json(n: int = 600):
+    rows = []
+    if LOGFILE.exists():
+        for line in LOGFILE.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]:
+            with contextlib.suppress(Exception):
+                rows.append(json.loads(line))
+    return {"rows": rows}
+
+
 @app.get("/agent/jobs")
 async def agent_jobs():
     return {"jobs": [job_public(j) for j in sorted(JOBS.values(), key=lambda j: j["started"])]}
@@ -423,10 +475,13 @@ async def call_tool(request: Request):
         return {"needs_confirmation": True, "summary": summary}
 
     log.info("tool call: %s args=%s", name, json.dumps(args)[:300])
+    st = TOOL_STATS.setdefault(name, {"calls": 0, "errors": 0, "total_ms": 0})
     flog("tool_call", name=name, args=json.dumps(args)[:600])
     tc0 = time.time()
     if name in ("delegate_to_claude_agent", "check_claude_agent"):
         text = await local_tool(name, args)
+        ms0 = int((time.time() - tc0) * 1000)
+        st.update(calls=st["calls"] + 1, total_ms=st["total_ms"] + ms0, last_ms=ms0, last=time.strftime("%H:%M:%S"))
         flog("tool_done", name=name, ms=int((time.time() - tc0) * 1000), out=text[:300])
         return {"output": text}
     try:
@@ -436,10 +491,14 @@ async def call_tool(request: Request):
                 result = await session.call_tool(name, args)
     except Exception as exc:  # noqa: BLE001
         log.exception("tool call failed")
+        st.update(calls=st["calls"] + 1, errors=st["errors"] + 1, last=time.strftime("%H:%M:%S"))
         flog("tool_error", name=name, error=str(exc)[:300])
         return {"output": json.dumps({"error": str(exc)})}
 
     ms = int((time.time() - tc0) * 1000)
+    st.update(calls=st["calls"] + 1, total_ms=st["total_ms"] + ms, last_ms=ms, last=time.strftime("%H:%M:%S"))
+    if getattr(result, "is_error", getattr(result, "isError", False)):
+        st["errors"] += 1
     log.info("tool done: %s in %d ms", name, ms)
     text = "\n".join(c.text for c in result.content if getattr(c, "type", "") == "text")
     flog("tool_done", name=name, ms=ms, out=text[:300])

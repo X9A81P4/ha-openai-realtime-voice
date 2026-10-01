@@ -1,5 +1,5 @@
 name: "OpenAI Realtime Voice"
-version: "0.3.0"
+version: "0.4.0"
 slug: openai_realtime_voice
 description: "Talk to Home Assistant with the OpenAI Realtime API (speech-to-speech) from a sidebar panel"
 url: "https://platform.openai.com/docs/guides/realtime"
@@ -27,7 +27,7 @@ options:
   agent_model: "sonnet"
   agent_max_turns: 40
   agent_timeout_s: 600
-  confirm_agent: true
+  confirm_agent: false
   max_tool_output_chars: 12000
   instructions: "You are a voice assistant for a smart home. Keep replies short and conversational. Use the available tools to look up or change things in Home Assistant. Before anything destructive, say what you are about to do. If a tool call is held for confirmation, tell the user to press Confirm on screen."
 schema:
