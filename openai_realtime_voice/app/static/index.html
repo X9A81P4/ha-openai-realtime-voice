@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#1b1b1f; --muted:#6b6f76; --card:#f3f4f6; --accent:#0b6bcb; --danger:#c62828; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111214; --fg:#ececf0; --muted:#9a9ea6; --card:#1c1d21; --accent:#4ea3ff; --danger:#ff6b6b; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.45 system-ui, sans-serif; display:flex; flex-direction:column; height:100vh; }
+  header { padding:16px; display:flex; gap:12px; align-items:center; border-bottom:1px solid var(--card); }
+  button { font:inherit; padding:10px 18px; border-radius:10px; border:0; background:var(--accent); color:#fff; cursor:pointer; }
+  button.stop { background:var(--danger); }
+  button.ghost { background:var(--card); color:var(--fg); }
+  #status { color:var(--muted); font-size:14px; }
+  #log { flex:1; overflow:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:80%; padding:10px 14px; border-radius:14px; background:var(--card); }
+  .msg.user { align-self:flex-end; background:var(--accent); color:#fff; }
+  .msg.tool { font:13px ui-monospace, monospace; color:var(--muted); background:transparent; padding:0 4px; }
+  #confirm { display:none; position:fixed; inset:0; background:rgba(0,0,0,.5); align-items:center; justify-content:center; padding:16px; }
+  #confirm .box { background:var(--bg); border-radius:14px; padding:20px; max-width:480px; width:100%; }
+  #confirm pre { white-space:pre-wrap; word-break:break-word; background:var(--card); padding:10px; border-radius:8px; font-size:13px; }
+  #confirm .row { display:flex; gap:10px; justify-content:flex-end; margin-top:12px; }
+</style>
+</head>
+<body>
+<header>
+  <button id="toggle">Start</button>
+  <span id="status">Idle</span>
+</header>
+<div id="log"></div>
+<div id="confirm"><div class="box">
+  <strong>Confirm action</strong>
+  <p>The assistant wants to run a potentially destructive tool:</p>
+  <pre id="confirm-text"></pre>
+  <div class="row"><button class="ghost" id="deny">Cancel</button><button class="stop" id="allow">Confirm</button></div>
+</div></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let pc = null, dc = null, stream = null, running = false;
+const handled = new Set();
+
+function say(text, cls) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.textContent = text;
+  $('log').appendChild(d);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+function setStatus(s) { $('status').textContent = s; }
+
+function askConfirm(summary) {
+  return new Promise((resolve) => {
+    $('confirm-text').textContent = summary;
+    $('confirm').style.display = 'flex';
+    const done = (v) => { $('confirm').style.display = 'none'; resolve(v); };
+    $('allow').onclick = () => done(true);
+    $('deny').onclick = () => done(false);
+  });
+}
+
+async function runTool(item) {
+  if (handled.has(item.call_id)) return;
+  handled.add(item.call_id);
+  say('tool: ' + item.name, 'tool');
+  let out;
+  try {
+    let r = await fetch('./tool', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: item.name, arguments: item.arguments }) });
+    let j = await r.json();
+    if (j.needs_confirmation) {
+      const ok = await askConfirm(j.summary);
+      if (!ok) { out = JSON.stringify({ error: 'The user declined this action.' }); }
+      else {
+        r = await fetch('./tool', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: item.name, arguments: item.arguments, confirmed: true }) });
+        j = await r.json();
+        out = j.output;
+      }
+    } else { out = j.output ?? JSON.stringify(j); }
+  } catch (e) { out = JSON.stringify({ error: String(e) }); }
+  dc.send(JSON.stringify({ type: 'conversation.item.create',
+    item: { type: 'function_call_output', call_id: item.call_id, output: out } }));
+  dc.send(JSON.stringify({ type: 'response.create' }));
+}
+
+function onEvent(ev) {
+  switch (ev.type) {
+    case 'conversation.item.input_audio_transcription.completed':
+      if (ev.transcript && ev.transcript.trim()) say(ev.transcript.trim(), 'user'); break;
+    case 'response.output_audio_transcript.done':
+      if (ev.transcript) say(ev.transcript, 'assistant'); break;
+    case 'response.output_item.done':
+      if (ev.item && ev.item.type === 'function_call') runTool(ev.item); break;
+    case 'input_audio_buffer.speech_started': setStatus('Listening…'); break;
+    case 'input_audio_buffer.speech_stopped': setStatus('Thinking…'); break;
+    case 'response.done': setStatus('Connected'); break;
+    case 'error': say('Error: ' + (ev.error && ev.error.message || 'unknown'), 'tool'); break;
+  }
+}
+
+async function start() {
+  setStatus('Connecting…');
+  const s = await fetch('./session', { method: 'POST' });
+  const sj = await s.json();
+  if (!s.ok) { setStatus('Idle'); say(sj.error || 'Failed to start', 'tool'); return; }
+
+  pc = new RTCPeerConnection();
+  const audio = document.createElement('audio'); audio.autoplay = true;
+  pc.ontrack = (e) => { audio.srcObject = e.streams[0]; };
+  stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  pc.addTrack(stream.getAudioTracks()[0], stream);
+  dc = pc.createDataChannel('oai-events');
+  dc.onmessage = (e) => { try { onEvent(JSON.parse(e.data)); } catch {} };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  const r = await fetch('https://api.openai.com/v1/realtime/calls', {
+    method: 'POST', body: offer.sdp,
+    headers: { Authorization: 'Bearer ' + sj.client_secret, 'Content-Type': 'application/sdp' } });
+  if (!r.ok) { say('OpenAI connect failed: ' + r.status, 'tool'); stop(); return; }
+  await pc.setRemoteDescription({ type: 'answer', sdp: await r.text() });
+  running = true;
+  $('toggle').textContent = 'Stop'; $('toggle').classList.add('stop');
+  setStatus('Connected (' + sj.tool_count + ' tools)');
+}
+
+function stop() {
+  try { dc && dc.close(); } catch {}
+  try { pc && pc.close(); } catch {}
+  try { stream && stream.getTracks().forEach((t) => t.stop()); } catch {}
+  pc = dc = stream = null; running = false;
+  $('toggle').textContent = 'Start'; $('toggle').classList.remove('stop');
+  setStatus('Idle');
+}
+
+$('toggle').onclick = () => (running ? stop() : start().catch((e) => { say(String(e), 'tool'); stop(); }));
+</script>
+</body>
+</html>
