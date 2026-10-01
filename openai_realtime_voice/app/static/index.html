@@ -21,6 +21,9 @@
   #confirm .box { background:var(--bg); border-radius:14px; padding:20px; max-width:480px; width:100%; }
   #confirm pre { white-space:pre-wrap; word-break:break-word; background:var(--card); padding:10px; border-radius:8px; font-size:13px; }
   #confirm .row { display:flex; gap:10px; justify-content:flex-end; margin-top:12px; }
+  #dbgbar { padding:6px 12px; font-size:12px; border-top:1px solid #444; }
+  #live { opacity:.8; margin-left:8px; }
+  #dbg { margin:0; padding:8px 12px; font-size:11px; line-height:1.35; height:34vh; overflow:auto; white-space:pre-wrap; word-break:break-all; background:rgba(0,0,0,.25); }
 </style>
 </head>
 <body>
@@ -29,6 +32,8 @@
   <span id="status">Idle</span> <button id="audio-fix" style="display:none;margin-left:10px">Tap to enable sound</button> <a href="" target="_blank" id="full" style="margin-left:12px;color:#8ab4f8">Open full page</a>
 </header>
 <div id="log"></div>
+<div id="dbgbar"><button id="beep" class="ghost">Test speaker</button> <button id="copy" class="ghost">Copy logs</button> <button id="clr" class="ghost">Clear</button> <span id="live"></span></div>
+<pre id="dbg"></pre>
 <div id="confirm"><div class="box">
   <strong>Confirm action</strong>
   <p>The assistant wants to run a potentially destructive tool:</p>
@@ -49,6 +54,37 @@ function say(text, cls) {
   $('log').scrollTop = $('log').scrollHeight;
 }
 document.addEventListener('DOMContentLoaded',()=>{const f=document.getElementById('full'); if(f) f.href=location.href;});
+
+const T0 = Date.now(); let dbgLines = [];
+function dbg(msg) {
+  const t = ((Date.now() - T0) / 1000).toFixed(2).padStart(7);
+  const line = t + 's ' + msg; dbgLines.push(line); if (dbgLines.length > 800) dbgLines.shift();
+  const el = $('dbg'); el.textContent += line + '\n'; el.scrollTop = el.scrollHeight;
+}
+window.addEventListener('error', (e) => dbg('JS ERROR: ' + e.message));
+window.addEventListener('unhandledrejection', (e) => dbg('PROMISE REJECTED: ' + (e.reason && e.reason.message || e.reason)));
+let tm = {}, nAudioDelta = 0, nTextDelta = 0, statTimer = null;
+function beep() {
+  try {
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain(); o.frequency.value = 660; g.gain.value = 0.2;
+    o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + 0.4);
+    dbg('beep via WebAudio, ctx=' + ac.state + ' (heard nothing? check ringer switch, volume, output route)');
+  } catch (e) { dbg('beep failed: ' + e.message); }
+}
+async function pollStats() {
+  if (!pc) return;
+  try {
+    const st = await pc.getStats(); const o = [];
+    st.forEach((r) => {
+      if (r.type === 'inbound-rtp' && r.kind === 'audio') o.push('IN pkts=' + r.packetsReceived + ' bytes=' + r.bytesReceived + ' lvl=' + (r.audioLevel ?? 'n/a') + ' concealed=' + (r.concealedSamples ?? 0));
+      if (r.type === 'outbound-rtp' && r.kind === 'audio') o.push('OUT pkts=' + r.packetsSent + ' bytes=' + r.bytesSent);
+    });
+    const a = audioEl ? ('el paused=' + audioEl.paused + ' muted=' + audioEl.muted + ' vol=' + audioEl.volume + ' ready=' + audioEl.readyState + ' t=' + audioEl.currentTime.toFixed(1)) : 'el none';
+    const line = o.join(' | ') + ' | ' + a + ' | ice=' + pc.iceConnectionState + ' dc=' + (dc && dc.readyState);
+    $('live').textContent = line; if (pollStats.last !== line) { dbg('STATS ' + line); pollStats.last = line; }
+  } catch (e) { dbg('stats error ' + e.message); }
+}
 function setStatus(s) { $('status').textContent = s; }
 
 function askConfirm(summary) {
@@ -64,7 +100,7 @@ function askConfirm(summary) {
 async function runTool(item) {
   if (handled.has(item.call_id)) return;
   handled.add(item.call_id);
-  say('tool: ' + item.name, 'tool');
+  say('tool: ' + item.name, 'tool'); const tt = Date.now(); dbg('tool start ' + item.name + ' ' + String(item.arguments).slice(0, 200));
   let out;
   try {
     let r = await fetch('./tool', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -81,12 +117,31 @@ async function runTool(item) {
       }
     } else { out = j.output ?? JSON.stringify(j); }
   } catch (e) { out = JSON.stringify({ error: String(e) }); }
+  dbg('tool done ' + item.name + ' in ' + (Date.now() - tt) + 'ms, output ' + String(out).length + ' chars');
   dc.send(JSON.stringify({ type: 'conversation.item.create',
     item: { type: 'function_call_output', call_id: item.call_id, output: out } }));
   dc.send(JSON.stringify({ type: 'response.create' }));
 }
 
 function onEvent(ev) {
+  const ty = ev.type;
+  if (ty === 'response.output_audio.delta') { nAudioDelta++; if (nAudioDelta === 1) dbg('first audio chunk (+' + (Date.now() - (tm.created || Date.now())) + 'ms after response.created)'); }
+  else if (ty === 'response.output_audio_transcript.delta' || ty === 'response.output_text.delta') { nTextDelta++; }
+  else if (ty === 'rate_limits.updated') { }
+  else {
+    let extra = '';
+    if (ty === 'error') extra = ' ' + JSON.stringify(ev.error || ev).slice(0, 400);
+    if (ty === 'response.done') {
+      const r = ev.response || {};
+      extra = ' status=' + r.status + (r.status_details ? ' ' + JSON.stringify(r.status_details).slice(0, 300) : '') + (r.usage ? ' out_tokens=' + r.usage.output_tokens : '') + ' audio_chunks=' + nAudioDelta + ' text_deltas=' + nTextDelta;
+      if (nAudioDelta === 0) dbg('WARNING: response finished with ZERO audio chunks');
+      nAudioDelta = 0; nTextDelta = 0;
+    }
+    if (ty === 'response.created') { tm.created = Date.now(); if (tm.stopped) extra = ' (+' + (tm.created - tm.stopped) + 'ms after you stopped speaking)'; }
+    if (ty === 'input_audio_buffer.speech_stopped') tm.stopped = Date.now();
+    if (ty === 'response.output_item.done' && ev.item) extra = ' item=' + ev.item.type + (ev.item.name ? ':' + ev.item.name : '');
+    dbg('evt ' + ty + extra);
+  }
   switch (ev.type) {
     case 'conversation.item.input_audio_transcription.completed':
       if (ev.transcript && ev.transcript.trim()) say(ev.transcript.trim(), 'user'); break;
@@ -114,20 +169,27 @@ async function start() {
   const sj = await s.json();
   if (!s.ok) { setStatus('Idle'); say(sj.error || 'Failed to start', 'tool'); return; }
 
+  dbg('session ok: model=' + sj.model + ' tools=' + sj.tool_count);
   pc = new RTCPeerConnection();
+  pc.oniceconnectionstatechange = () => dbg('ice ' + pc.iceConnectionState);
+  pc.onconnectionstatechange = () => dbg('pc ' + pc.connectionState);
   audioEl = document.createElement('audio');
   audioEl.autoplay = true; audioEl.playsInline = true; audioEl.setAttribute('playsinline', '');
   audioEl.style.display = 'none'; document.body.appendChild(audioEl);
-  audioEl.play().catch(() => {});  // unlock inside the click gesture
+  ['playing', 'pause', 'stalled', 'error', 'suspend'].forEach((n) => audioEl.addEventListener(n, () => dbg('audio element: ' + n + (audioEl.error ? ' ' + audioEl.error.message : ''))));
+  audioEl.play().catch((e) => dbg('pre-play (fails until a track exists): ' + e.name));
   pc.ontrack = (e) => {
-    audioEl.srcObject = e.streams[0];
-    audioEl.muted = false; audioEl.volume = 1;
-    audioEl.play().catch(() => { $('audio-fix').style.display = 'inline-block'; });
+    dbg('ontrack kind=' + e.track.kind + ' streams=' + e.streams.length + ' muted=' + e.track.muted + ' state=' + e.track.readyState);
+    const ms = (e.streams && e.streams[0]) || new MediaStream([e.track]);
+    audioEl.srcObject = ms; audioEl.muted = false; audioEl.volume = 1;
+    audioEl.play().then(() => dbg('audio.play() ok')).catch((err) => { dbg('audio.play() BLOCKED: ' + err.name + ' ' + err.message); $('audio-fix').style.display = 'inline-block'; });
   };
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
-  catch (e) { setStatus('Idle'); say('Mic blocked: ' + e.name + ' ' + e.message, 'tool'); try { pc.close(); } catch {} return; }
+  catch (e) { setStatus('Idle'); say('Mic blocked: ' + e.name + ' ' + e.message, 'tool'); dbg('getUserMedia failed: ' + e.name); try { pc.close(); } catch {} return; }
+  dbg('mic ok: ' + (stream.getAudioTracks()[0].label || 'unnamed') + ' state=' + stream.getAudioTracks()[0].readyState);
   pc.addTrack(stream.getAudioTracks()[0], stream);
   dc = pc.createDataChannel('oai-events');
+  dc.onopen = () => dbg('datachannel open'); dc.onclose = () => dbg('datachannel closed'); dc.onerror = () => dbg('datachannel error');
   dc.onmessage = (e) => { try { onEvent(JSON.parse(e.data)); } catch {} };
 
   const offer = await pc.createOffer();
@@ -135,14 +197,15 @@ async function start() {
   const r = await fetch('https://api.openai.com/v1/realtime/calls', {
     method: 'POST', body: offer.sdp,
     headers: { Authorization: 'Bearer ' + sj.client_secret, 'Content-Type': 'application/sdp' } });
-  if (!r.ok) { say('OpenAI connect failed: ' + r.status, 'tool'); stop(); return; }
+  if (!r.ok) { const tx = await r.text(); dbg('OpenAI /calls failed ' + r.status + ' ' + tx.slice(0, 300)); say('OpenAI connect failed: ' + r.status, 'tool'); stop(); return; }
   await pc.setRemoteDescription({ type: 'answer', sdp: await r.text() });
-  running = true;
+  running = true; dbg('webrtc connected'); statTimer = setInterval(pollStats, 2000);
   $('toggle').textContent = 'Stop'; $('toggle').classList.add('stop');
   setStatus('Connected (' + sj.tool_count + ' tools)');
 }
 
 function stop() {
+  dbg('stop'); clearInterval(statTimer);
   try { dc && dc.close(); } catch {}
   try { pc && pc.close(); } catch {}
   try { if (audioEl) { audioEl.pause(); audioEl.srcObject = null; audioEl.remove(); } } catch {}
@@ -154,7 +217,10 @@ function stop() {
 }
 
 $('audio-fix').onclick = () => { audioEl && audioEl.play().then(() => { $('audio-fix').style.display = 'none'; }).catch((e) => say('Audio blocked: ' + e.message, 'tool')); };
-$('toggle').onclick = () => (running ? stop() : start().catch((e) => { say(String(e), 'tool'); stop(); }));
+$('beep').onclick = beep;
+$('clr').onclick = () => { $('dbg').textContent = ''; dbgLines = []; };
+$('copy').onclick = () => { const t = dbgLines.join('\n'); (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(() => dbg('logs copied'), () => { const r = document.createRange(); r.selectNodeContents($('dbg')); getSelection().removeAllRanges(); getSelection().addRange(r); dbg('text selected: use Copy from the menu'); }); };
+$('toggle').onclick = () => (running ? stop() : (dbg('start pressed; secure=' + window.isSecureContext + ' framed=' + (window.self !== window.top) + ' ua=' + navigator.userAgent.slice(0, 90)), start()).catch((e) => { say(String(e), 'tool'); stop(); }));
 </script>
 </body>
 </html>
