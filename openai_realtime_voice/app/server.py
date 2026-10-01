@@ -63,7 +63,7 @@ async def list_tools() -> list[dict]:
             result = await session.list_tools()
     tools = []
     for t in result.tools:
-        schema = t.inputSchema or {"type": "object", "properties": {}}
+        schema = getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {"type": "object", "properties": {}}
         schema.setdefault("type", "object")
         tools.append(
             {
@@ -168,7 +168,7 @@ async def call_tool(request: Request):
     )
     if len(text) > MAX_OUT:
         text = text[:MAX_OUT] + "\n...[truncated]"
-    if result.isError:
+    if getattr(result, "is_error", getattr(result, "isError", False)):
         text = json.dumps({"error": text})
     return {"output": text}
 
