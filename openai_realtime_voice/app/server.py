@@ -15,10 +15,18 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from mcp import ClientSession
+import contextlib
 try:
-    from mcp.client.streamable_http import streamable_http_client as streamablehttp_client
+    from mcp.client.streamable_http import streamable_http_client as _client
 except ImportError:
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.client.streamable_http import streamablehttp_client as _client
+
+
+@contextlib.asynccontextmanager
+async def streamablehttp_client(url):
+    # New SDK yields (read, write); old SDK yields (read, write, get_session_id).
+    async with _client(url) as streams:
+        yield streams[0], streams[1], None
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("realtime-voice")
