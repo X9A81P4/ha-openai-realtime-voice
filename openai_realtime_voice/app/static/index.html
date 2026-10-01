@@ -26,7 +26,7 @@
 <body>
 <header>
   <button id="toggle">Start</button>
-  <span id="status">Idle</span> <a href="" target="_blank" id="full" style="margin-left:12px;color:#8ab4f8">Open full page</a>
+  <span id="status">Idle</span> <button id="audio-fix" style="display:none;margin-left:10px">Tap to enable sound</button> <a href="" target="_blank" id="full" style="margin-left:12px;color:#8ab4f8">Open full page</a>
 </header>
 <div id="log"></div>
 <div id="confirm"><div class="box">
@@ -38,7 +38,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let pc = null, dc = null, stream = null, running = false;
+let pc = null, dc = null, stream = null, audioEl = null, running = false;
 const handled = new Set();
 
 function say(text, cls) {
@@ -115,9 +115,16 @@ async function start() {
   if (!s.ok) { setStatus('Idle'); say(sj.error || 'Failed to start', 'tool'); return; }
 
   pc = new RTCPeerConnection();
-  const audio = document.createElement('audio'); audio.autoplay = true;
-  pc.ontrack = (e) => { audio.srcObject = e.streams[0]; };
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  audioEl = document.createElement('audio');
+  audioEl.autoplay = true; audioEl.playsInline = true; audioEl.setAttribute('playsinline', '');
+  audioEl.style.display = 'none'; document.body.appendChild(audioEl);
+  audioEl.play().catch(() => {});  // unlock inside the click gesture
+  pc.ontrack = (e) => {
+    audioEl.srcObject = e.streams[0];
+    audioEl.muted = false; audioEl.volume = 1;
+    audioEl.play().catch(() => { $('audio-fix').style.display = 'inline-block'; });
+  };
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
   catch (e) { setStatus('Idle'); say('Mic blocked: ' + e.name + ' ' + e.message, 'tool'); try { pc.close(); } catch {} return; }
   pc.addTrack(stream.getAudioTracks()[0], stream);
   dc = pc.createDataChannel('oai-events');
@@ -138,12 +145,15 @@ async function start() {
 function stop() {
   try { dc && dc.close(); } catch {}
   try { pc && pc.close(); } catch {}
+  try { if (audioEl) { audioEl.pause(); audioEl.srcObject = null; audioEl.remove(); } } catch {}
+  audioEl = null; $('audio-fix').style.display = 'none';
   try { stream && stream.getTracks().forEach((t) => t.stop()); } catch {}
   pc = dc = stream = null; running = false;
   $('toggle').textContent = 'Start'; $('toggle').classList.remove('stop');
   setStatus('Idle');
 }
 
+$('audio-fix').onclick = () => { audioEl && audioEl.play().then(() => { $('audio-fix').style.display = 'none'; }).catch((e) => say('Audio blocked: ' + e.message, 'tool')); };
 $('toggle').onclick = () => (running ? stop() : start().catch((e) => { say(String(e), 'tool'); stop(); }));
 </script>
 </body>

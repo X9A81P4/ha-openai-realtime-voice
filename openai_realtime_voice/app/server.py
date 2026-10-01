@@ -113,7 +113,8 @@ async def create_session():
             "tool_choice": "auto",
             "audio": {
                 "input": {
-                    "transcription": {"model": "gpt-4o-mini-transcribe"},
+                    "transcription": {"model": "gpt-4o-mini-transcribe", "language": "en"},
+                    "noise_reduction": {"type": "near_field"},
                     "turn_detection": {"type": "semantic_vad"},
                 },
                 "output": {"voice": VOICE},
