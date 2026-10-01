@@ -60,6 +60,9 @@ function dbg(msg) {
   const t = ((Date.now() - T0) / 1000).toFixed(2).padStart(7);
   const line = t + 's ' + msg; dbgLines.push(line); if (dbgLines.length > 800) dbgLines.shift();
   const el = $('dbg'); el.textContent += line + '\n'; el.scrollTop = el.scrollHeight;
+  if (/^(evt (error|response\.(created|done))|first audio|WARNING|OpenAI|tool |audio\.play|ontrack|ice |pc |getUserMedia)/.test(msg)) {
+    try { fetch('./clientlog', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ msg }) }); } catch {}
+  }
 }
 window.addEventListener('error', (e) => dbg('JS ERROR: ' + e.message));
 window.addEventListener('unhandledrejection', (e) => dbg('PROMISE REJECTED: ' + (e.reason && e.reason.message || e.reason)));
@@ -73,6 +76,8 @@ function beep() {
   } catch (e) { dbg('beep failed: ' + e.message); }
 }
 async function pollStats() {
+  if (!pc) return;
+  if (tm.created && !tm.firstAudio && Date.now() - tm.created > 8000 && !tm.warned) { tm.warned = true; dbg('WARNING: response created ' + Math.round((Date.now() - tm.created) / 1000) + 's ago with no audio and no response.done'); }
   if (!pc) return;
   try {
     const st = await pc.getStats(); const o = [];
@@ -125,7 +130,7 @@ async function runTool(item) {
 
 function onEvent(ev) {
   const ty = ev.type;
-  if (ty === 'response.output_audio.delta') { nAudioDelta++; if (nAudioDelta === 1) dbg('first audio chunk (+' + (Date.now() - (tm.created || Date.now())) + 'ms after response.created)'); }
+  if (ty === 'response.output_audio.delta') { nAudioDelta++; if (nAudioDelta === 1) tm.firstAudio = Date.now(); if (nAudioDelta === 1) dbg('first audio chunk (+' + (Date.now() - (tm.created || Date.now())) + 'ms after response.created)'); }
   else if (ty === 'response.output_audio_transcript.delta' || ty === 'response.output_text.delta') { nTextDelta++; }
   else if (ty === 'rate_limits.updated') { }
   else {
@@ -137,7 +142,7 @@ function onEvent(ev) {
       if (nAudioDelta === 0) dbg('WARNING: response finished with ZERO audio chunks');
       nAudioDelta = 0; nTextDelta = 0;
     }
-    if (ty === 'response.created') { tm.created = Date.now(); if (tm.stopped) extra = ' (+' + (tm.created - tm.stopped) + 'ms after you stopped speaking)'; }
+    if (ty === 'response.created') { tm.created = Date.now(); tm.firstAudio = 0; tm.warned = false; if (tm.stopped) extra = ' (+' + (tm.created - tm.stopped) + 'ms after you stopped speaking)'; }
     if (ty === 'input_audio_buffer.speech_stopped') tm.stopped = Date.now();
     if (ty === 'response.output_item.done' && ev.item) extra = ' item=' + ev.item.type + (ev.item.name ? ':' + ev.item.name : '');
     dbg('evt ' + ty + extra);
@@ -165,7 +170,9 @@ async function start() {
     return;
   }
   setStatus('Connecting…');
+  const ts = Date.now(); dbg('POST ./session (add-on -> OpenAI client_secrets)');
   const s = await fetch('./session', { method: 'POST' });
+  dbg('./session -> ' + s.status + ' in ' + (Date.now() - ts) + 'ms');
   const sj = await s.json();
   if (!s.ok) { setStatus('Idle'); say(sj.error || 'Failed to start', 'tool'); return; }
 
@@ -194,10 +201,12 @@ async function start() {
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
+  const tc = Date.now(); dbg('OpenAI POST /v1/realtime/calls (sdp ' + offer.sdp.length + ' bytes)');
   const r = await fetch('https://api.openai.com/v1/realtime/calls', {
     method: 'POST', body: offer.sdp,
     headers: { Authorization: 'Bearer ' + sj.client_secret, 'Content-Type': 'application/sdp' } });
   if (!r.ok) { const tx = await r.text(); dbg('OpenAI /calls failed ' + r.status + ' ' + tx.slice(0, 300)); say('OpenAI connect failed: ' + r.status, 'tool'); stop(); return; }
+  dbg('OpenAI /calls -> ' + r.status + ' in ' + (Date.now() - tc) + 'ms');
   await pc.setRemoteDescription({ type: 'answer', sdp: await r.text() });
   running = true; dbg('webrtc connected'); statTimer = setInterval(pollStats, 2000);
   $('toggle').textContent = 'Stop'; $('toggle').classList.add('stop');

@@ -1,5 +1,5 @@
 name: "OpenAI Realtime Voice"
-version: "0.1.6"
+version: "0.2.0"
 slug: openai_realtime_voice
 description: "Talk to Home Assistant with the OpenAI Realtime API (speech-to-speech) from a sidebar panel"
 url: "https://platform.openai.com/docs/guides/realtime"
@@ -17,7 +17,8 @@ boot: auto
 options:
   openai_api_key: ""
   ha_mcp_url: ""
-  model: "gpt-realtime"
+  model: "gpt-realtime-2.1"
+  tool_allowlist: "ha_search,ha_get_state,ha_get_overview,ha_list_floors_areas,ha_get_entity,ha_get_device,ha_call_service,ha_bulk_control,ha_list_services,ha_get_history,ha_get_todo,ha_set_todo_item,ha_get_operation_status,ha_config_get_calendar_events"
   voice: "marin"
   confirm_destructive: true
   max_tool_output_chars: 12000
@@ -26,6 +27,7 @@ schema:
   openai_api_key: password
   ha_mcp_url: str
   model: str
+  tool_allowlist: str
   voice: str
   confirm_destructive: bool
   max_tool_output_chars: int(2000,50000)

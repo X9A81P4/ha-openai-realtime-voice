@@ -7,6 +7,7 @@
 """
 import json
 import logging
+import time
 import re
 from pathlib import Path
 
@@ -34,7 +35,8 @@ log = logging.getLogger("realtime-voice")
 OPTIONS = json.loads(Path("/data/options.json").read_text())
 API_KEY = OPTIONS.get("openai_api_key", "")
 MCP_URL = OPTIONS.get("ha_mcp_url", "")
-MODEL = OPTIONS.get("model", "gpt-realtime")
+MODEL = OPTIONS.get("model", "gpt-realtime-2.1")
+ALLOW = {t.strip() for t in str(OPTIONS.get("tool_allowlist", "")).split(",") if t.strip()}
 VOICE = OPTIONS.get("voice", "marin")
 CONFIRM = bool(OPTIONS.get("confirm_destructive", True))
 MAX_OUT = int(OPTIONS.get("max_tool_output_chars", 12000))
@@ -62,7 +64,10 @@ async def list_tools() -> list[dict]:
             await session.initialize()
             result = await session.list_tools()
     tools = []
+    all_names = [t.name for t in result.tools]
     for t in result.tools:
+        if ALLOW and t.name not in ALLOW:
+            continue
         schema = getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {"type": "object", "properties": {}}
         schema.setdefault("type", "object")
         tools.append(
@@ -73,6 +78,11 @@ async def list_tools() -> list[dict]:
                 "parameters": schema,
             }
         )
+    if ALLOW:
+        missing = sorted(ALLOW - set(all_names))
+        if missing:
+            log.warning("allowlisted tools not found on server: %s", missing)
+    log.info("tools: %d of %d exposed, schema %d bytes", len(tools), len(all_names), len(json.dumps(tools)))
     return tools
 
 
@@ -121,12 +131,15 @@ async def create_session():
             },
         }
     }
+    t0 = time.time()
+    log.info("OpenAI client_secrets -> model=%s tools=%d payload=%d bytes", MODEL, len(tools), len(json.dumps(body)))
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(
             "https://api.openai.com/v1/realtime/client_secrets",
             headers={"Authorization": f"Bearer {API_KEY}"},
             json=body,
         )
+    log.info("OpenAI client_secrets <- %s in %d ms", resp.status_code, (time.time() - t0) * 1000)
     if resp.status_code >= 400:
         log.error("client_secrets failed: %s %s", resp.status_code, resp.text[:300])
         return JSONResponse(
@@ -134,6 +147,16 @@ async def create_session():
         )
     data = resp.json()
     return {"client_secret": data.get("value"), "tool_count": len(tools), "model": MODEL}
+
+
+@app.post("/clientlog")
+async def clientlog(request: Request):
+    try:
+        d = await request.json()
+    except Exception:  # noqa: BLE001
+        return {"ok": False}
+    log.info("browser: %s", str(d.get("msg", ""))[:500])
+    return {"ok": True}
 
 
 @app.post("/tool")
@@ -154,7 +177,8 @@ async def call_tool(request: Request):
             "summary": f"{name}({json.dumps(args)[:300]})",
         }
 
-    log.info("tool call: %s", name)
+    log.info("tool call: %s args=%s", name, json.dumps(args)[:300])
+    tc0 = time.time()
     try:
         async with streamablehttp_client(MCP_URL) as (read, write, _):
             async with ClientSession(read, write) as session:
@@ -164,6 +188,7 @@ async def call_tool(request: Request):
         log.exception("tool call failed")
         return {"output": json.dumps({"error": str(exc)})}
 
+    log.info("tool done: %s in %d ms", name, (time.time() - tc0) * 1000)
     text = "\n".join(
         c.text for c in result.content if getattr(c, "type", "") == "text"
     )
