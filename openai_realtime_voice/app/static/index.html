@@ -26,7 +26,7 @@
 <body>
 <header>
   <button id="toggle">Start</button>
-  <span id="status">Idle</span>
+  <span id="status">Idle</span> <a href="" target="_blank" id="full" style="margin-left:12px;color:#8ab4f8">Open full page</a>
 </header>
 <div id="log"></div>
 <div id="confirm"><div class="box">
@@ -48,6 +48,7 @@ function say(text, cls) {
   $('log').appendChild(d);
   $('log').scrollTop = $('log').scrollHeight;
 }
+document.addEventListener('DOMContentLoaded',()=>{const f=document.getElementById('full'); if(f) f.href=location.href;});
 function setStatus(s) { $('status').textContent = s; }
 
 function askConfirm(summary) {
@@ -101,6 +102,13 @@ function onEvent(ev) {
 }
 
 async function start() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    const framed = window.self !== window.top;
+    say('Microphone API unavailable here (secure=' + window.isSecureContext + ', framed=' + framed + '). ' +
+        (framed ? 'The HA app blocks the mic in the sidebar frame. Use "Open full page" above, in Safari or Chrome.' :
+                  'This page needs HTTPS.'), 'tool');
+    return;
+  }
   setStatus('Connecting…');
   const s = await fetch('./session', { method: 'POST' });
   const sj = await s.json();
@@ -109,7 +117,8 @@ async function start() {
   pc = new RTCPeerConnection();
   const audio = document.createElement('audio'); audio.autoplay = true;
   pc.ontrack = (e) => { audio.srcObject = e.streams[0]; };
-  stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { setStatus('Idle'); say('Mic blocked: ' + e.name + ' ' + e.message, 'tool'); try { pc.close(); } catch {} return; }
   pc.addTrack(stream.getAudioTracks()[0], stream);
   dc = pc.createDataChannel('oai-events');
   dc.onmessage = (e) => { try { onEvent(JSON.parse(e.data)); } catch {} };
