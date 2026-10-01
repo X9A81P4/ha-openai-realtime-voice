@@ -13,7 +13,12 @@ import contextlib
 import json
 import logging
 import os
+import fcntl
+import pty
 import re
+import signal
+import struct
+import termios
 import time
 import uuid
 from pathlib import Path
@@ -55,6 +60,9 @@ CLAUDE_TOKEN = OPTIONS.get("claude_oauth_token") or ""
 AGENT_MODEL = OPTIONS.get("agent_model", "sonnet")
 AGENT_TURNS = int(OPTIONS.get("agent_max_turns", 40))
 AGENT_TIMEOUT = int(OPTIONS.get("agent_timeout_s", 600))
+TOKEN_FILE = Path("/data/claude_oauth_token")
+if not CLAUDE_TOKEN and TOKEN_FILE.exists():
+    CLAUDE_TOKEN = TOKEN_FILE.read_text().strip()
 CONFIRM_AGENT = bool(OPTIONS.get("confirm_agent", True))
 AUTO_STOP = bool(OPTIONS.get("auto_stop_idle", True))
 IDLE_S = int(OPTIONS.get("idle_timeout_s", 120))
@@ -268,8 +276,8 @@ async def run_job(job: dict) -> None:
 async def local_tool(name: str, args: dict) -> str:
     if name == "delegate_to_claude_agent":
         if not (ANTHROPIC_KEY or CLAUDE_TOKEN):
-            return json.dumps({"error": "The Claude agent is not set up yet: add claude_oauth_token or "
-                                        "anthropic_api_key in the add-on options."})
+            return json.dumps({"error": "The Claude agent is not set up yet: press Sign in with Claude on "
+                                        "the Voice page (or set claude_oauth_token / anthropic_api_key in the add-on options)."})
         task = str(args.get("task", "")).strip()
         if not task:
             return json.dumps({"error": "task is required"})
@@ -288,6 +296,97 @@ async def local_tool(name: str, args: dict) -> str:
         return json.dumps(job_public(job) if job else {"error": "no agent jobs yet"})
     return json.dumps({"error": "unknown local tool"})
 
+
+
+# ----------------------------------------------------------- Claude sign-in (OAuth)
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Z0-9]|\r")
+LOGIN: dict = {"pid": None, "fd": None, "buf": "", "url": None, "status": "idle", "started": 0.0, "error": None}
+
+
+def _login_kill() -> None:
+    pid, fd = LOGIN.get("pid"), LOGIN.get("fd")
+    if pid:
+        with contextlib.suppress(Exception):
+            os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            os.waitpid(pid, os.WNOHANG)
+    if fd is not None:
+        with contextlib.suppress(Exception):
+            os.close(fd)
+    LOGIN.update(pid=None, fd=None)
+
+
+async def _login_reader() -> None:
+    global CLAUDE_TOKEN
+    fd = LOGIN["fd"]
+    t0 = time.time()
+    while LOGIN.get("fd") == fd and time.time() - t0 < 900:
+        try:
+            chunk = os.read(fd, 8192)
+            if not chunk:
+                break
+            LOGIN["buf"] = (LOGIN["buf"] + chunk.decode("utf-8", "replace"))[-60000:]
+        except BlockingIOError:
+            await asyncio.sleep(0.2)
+            continue
+        except OSError:
+            break
+        clean = ANSI.sub("", LOGIN["buf"])
+        if not LOGIN["url"]:
+            m = re.search(r"https://claude\.(?:ai|com)/\S+", clean)
+            if m and "code_challenge" in m.group(0) and "state=" in m.group(0):
+                LOGIN["url"] = m.group(0)
+                LOGIN["status"] = "waiting_code"
+                flog("claude_login", step="url_ready")
+        m = re.search(r"sk-ant-[A-Za-z0-9]+-[A-Za-z0-9_\-]{40,}", clean.replace("\n", ""))
+        if m:
+            tok = m.group(0)
+            TOKEN_FILE.write_text(tok)
+            os.chmod(TOKEN_FILE, 0o600)
+            CLAUDE_TOKEN = tok
+            LOGIN["status"] = "done"
+            flog("claude_login", step="token_saved")
+            log.info("claude sign-in complete (token stored in /data)")
+            break
+    if LOGIN["status"] not in ("done",):
+        tail = ANSI.sub("", LOGIN["buf"])[-500:]
+        if LOGIN["status"] == "waiting_code" or LOGIN["status"] == "starting":
+            LOGIN["status"] = "failed"
+            LOGIN["error"] = "login process ended: " + tail.strip().replace("\n", " ")[-300:]
+            flog("claude_login", step="failed", detail=LOGIN["error"])
+    await asyncio.sleep(1)
+    _login_kill()
+
+
+async def login_start() -> dict:
+    _login_kill()
+    LOGIN.update(buf="", url=None, status="starting", started=time.time(), error=None)
+    Path("/data/claude").mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "HOME": "/data/claude", "TERM": "xterm", "COLUMNS": "400", "LINES": "60",
+           "BROWSER": "none", "NO_COLOR": "1", "CI": ""}
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    env.pop("ANTHROPIC_API_KEY", None)
+    pid, fd = pty.fork()
+    if pid == 0:  # child
+        try:
+            os.execvpe("claude", ["claude", "setup-token"], env)
+        finally:
+            os._exit(127)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 400, 0, 0))
+    fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+    LOGIN.update(pid=pid, fd=fd)
+    asyncio.create_task(_login_reader())
+    for _ in range(100):  # up to ~20 s for the URL
+        if LOGIN["url"] or LOGIN["status"] in ("failed", "done"):
+            break
+        await asyncio.sleep(0.2)
+    return login_state()
+
+
+def login_state() -> dict:
+    return {"signed_in": bool(CLAUDE_TOKEN or ANTHROPIC_KEY), "status": LOGIN["status"], "url": LOGIN["url"],
+            "error": LOGIN["error"], "source": "api_key" if ANTHROPIC_KEY else ("token" if CLAUDE_TOKEN else None),
+            "debug_tail": ANSI.sub("", LOGIN["buf"])[-300:] if LOGIN["status"] in ("starting", "failed") else None}
 
 # ---------------------------------------------------------------------- routes
 @app.on_event("startup")
@@ -314,6 +413,65 @@ async def logs(n: int = 400):
         return PlainTextResponse("(no log yet)")
     lines = LOGFILE.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
     return PlainTextResponse("\n".join(lines))
+
+
+@app.get("/claude/status")
+async def claude_status():
+    return login_state()
+
+
+@app.post("/claude/login/start")
+async def claude_login_start():
+    return await login_start()
+
+
+@app.post("/claude/login/code")
+async def claude_login_code(request: Request):
+    d = await request.json()
+    code = str(d.get("code", "")).strip()
+    if not code or LOGIN.get("fd") is None:
+        return JSONResponse({"error": "No login in progress. Press Sign in again."}, 400)
+    fd = LOGIN["fd"]
+    os.write(fd, code.encode())
+    await asyncio.sleep(0.4)
+    os.write(fd, b"\r")
+    for _ in range(100):  # up to ~20 s for the token
+        if LOGIN["status"] in ("done", "failed"):
+            break
+        await asyncio.sleep(0.2)
+    return login_state()
+
+
+@app.post("/claude/logout")
+async def claude_logout():
+    global CLAUDE_TOKEN
+    _login_kill()
+    with contextlib.suppress(Exception):
+        TOKEN_FILE.unlink()
+    CLAUDE_TOKEN = ""
+    LOGIN.update(status="idle", url=None, error=None, buf="")
+    flog("claude_login", step="signed_out")
+    return login_state()
+
+
+@app.post("/claude/test")
+async def claude_test():
+    if not (ANTHROPIC_KEY or CLAUDE_TOKEN):
+        return {"ok": False, "error": "Not signed in."}
+    p = await asyncio.create_subprocess_exec(
+        "claude", "-p", "Reply with exactly: ok", "--max-turns", "1", "--output-format", "json",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=agent_env(), cwd="/data/claude")
+    try:
+        out, err = await asyncio.wait_for(p.communicate(), 90)
+    except asyncio.TimeoutError:
+        p.kill()
+        return {"ok": False, "error": "timed out"}
+    try:
+        j = json.loads(out.decode().strip().splitlines()[-1])
+    except Exception:  # noqa: BLE001
+        j = {}
+    ok = p.returncode == 0 and not j.get("is_error")
+    return {"ok": ok, "result": (j.get("result") or err.decode()[-300:])[:300]}
 
 
 @app.get("/tools")

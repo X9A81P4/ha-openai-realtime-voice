@@ -121,6 +121,16 @@ body[data-state=error] .orb{--c:var(--red)}
 </nav>
 <main>
   <section class="tab on" id="tab-voice">
+    <div class="card" id="claudebar" style="padding:10px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <span class="badge" id="cb-badge">Claude agent: checking</span>
+      <span id="cb-msg" style="color:var(--muted);font-size:13px"></span>
+      <button class="btn sm pri" id="cb-signin" style="display:none">Sign in with Claude</button>
+      <a class="btn sm" id="cb-open" target="_blank" rel="noopener" style="display:none;text-decoration:none">1. Open Claude sign-in</a>
+      <input id="cb-code" placeholder="2. Paste the code here" style="display:none;flex:1;min-width:180px" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button class="btn sm pri" id="cb-send" style="display:none">3. Connect</button>
+      <button class="btn sm" id="cb-test" style="display:none">Test</button>
+      <button class="btn sm ghost" id="cb-out" style="display:none">Sign out</button>
+    </div>
     <div class="card stage">
       <div class="orbwrap"><div class="orb" id="orb"></div></div>
       <div class="stagetxt">
@@ -546,6 +556,41 @@ $('lq').oninput = renderLogs; $('lref').onclick = loadLogs;
 document.querySelectorAll('[data-lf]').forEach((b) => b.onclick = () => { lf = b.dataset.lf; document.querySelectorAll('[data-lf]').forEach((x) => x.classList.toggle('on', x === b)); renderLogs(); });
 $('lauto').onchange = () => { clearInterval(lTimer); if ($('lauto').checked) lTimer = setInterval(loadLogs, 3000); };
 fetch('./tools').then((r) => r.json()).then((j) => { $('n-tools').textContent = j.exposed + '/' + (j.total + 2); }).catch(() => {});
+
+// ---------------------------------------------------------------- Claude sign-in
+let cbPoll = null;
+function cbShow(ids) { ['cb-signin', 'cb-open', 'cb-code', 'cb-send', 'cb-test', 'cb-out'].forEach((i) => { $(i).style.display = ids.includes(i) ? '' : 'none'; }); }
+function cbRender(s) {
+  const b = $('cb-badge'), m = $('cb-msg');
+  if (s.signed_in) {
+    b.className = 'badge green'; b.textContent = 'Claude agent: signed in'; m.textContent = s.source === 'api_key' ? 'Using the API key from the add-on options.' : 'Voice can now hand jobs to a Claude agent.';
+    cbShow(['cb-test'].concat(s.source === 'token' ? ['cb-out'] : [])); return;
+  }
+  if (s.status === 'waiting_code') {
+    b.className = 'badge amber'; b.textContent = 'Claude agent: waiting for code'; m.textContent = 'Open the link, approve, copy the code Anthropic shows, paste it here.';
+    $('cb-open').href = s.url || '#'; cbShow(['cb-open', 'cb-code', 'cb-send']); return;
+  }
+  if (s.status === 'starting') { b.className = 'badge amber'; b.textContent = 'Claude agent: starting sign-in'; m.textContent = ''; cbShow([]); return; }
+  b.className = 'badge red'; b.textContent = 'Claude agent: not signed in';
+  m.textContent = s.error ? ('Sign-in failed: ' + s.error) : 'Sign in once so voice can delegate jobs to Claude.';
+  cbShow(['cb-signin']);
+}
+async function cbRefresh() { try { const s = await (await fetch('./claude/status')).json(); cbRender(s); sendlog('claude status ' + s.status + ' signed_in=' + s.signed_in); return s; } catch (e) { $('cb-badge').textContent = 'Claude agent: unknown'; } }
+$('cb-signin').onclick = async () => {
+  $('cb-msg').textContent = 'Starting sign-in...'; $('cb-signin').disabled = true;
+  try { const s = await (await fetch('./claude/login/start', { method: 'POST' })).json(); cbRender(s); if (s.url) { try { window.open(s.url, '_blank', 'noopener'); } catch {} } else if (s.status === 'failed') dbg('claude login failed: ' + (s.error || s.debug_tail)); }
+  catch (e) { $('cb-msg').textContent = 'Error: ' + e.message; }
+  $('cb-signin').disabled = false;
+};
+$('cb-send').onclick = async () => {
+  const code = $('cb-code').value.trim(); if (!code) return; $('cb-msg').textContent = 'Connecting...'; $('cb-send').disabled = true;
+  try { const s = await (await fetch('./claude/login/code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) })).json(); $('cb-code').value = ''; cbRender(s); if (!s.signed_in) $('cb-msg').textContent = s.error || 'Not connected yet. Check the code and try again.'; }
+  catch (e) { $('cb-msg').textContent = 'Error: ' + e.message; }
+  $('cb-send').disabled = false;
+};
+$('cb-test').onclick = async () => { $('cb-msg').textContent = 'Testing the agent (up to a minute)...'; try { const r = await (await fetch('./claude/test', { method: 'POST' })).json(); $('cb-msg').textContent = r.ok ? 'Agent works: ' + r.result : 'Agent test failed: ' + (r.error || r.result); } catch (e) { $('cb-msg').textContent = 'Error: ' + e.message; } };
+$('cb-out').onclick = async () => { cbRender(await (await fetch('./claude/logout', { method: 'POST' })).json()); };
+cbRefresh();
 </script>
 </body>
 </html>

@@ -1,5 +1,5 @@
 name: "OpenAI Realtime Voice"
-version: "0.4.0"
+version: "0.4.1"
 slug: openai_realtime_voice
 description: "Talk to Home Assistant with the OpenAI Realtime API (speech-to-speech) from a sidebar panel"
 url: "https://platform.openai.com/docs/guides/realtime"
